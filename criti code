@@ -1,0 +1,225 @@
+#include <AsyncEventSource.h>
+#include <AsyncJson.h>
+#include <AsyncWebSocket.h>
+#include <AsyncWebSynchronization.h>
+#include <ESPAsyncWebSrv.h>
+#include <SPIFFSEditor.h>
+#include <StringArray.h>
+#include <WebAuthentication.h>
+#include <WebHandlerImpl.h>
+#include <WebResponseImpl.h>
+
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Hash.h>
+
+#include <ESPAsyncTCP.h>
+#include <Adafruit_Sensor.h>
+#include<DHT.h>
+#include <Wire.h>
+#include "MAX30100_PulseOximeter.h"
+
+const char* ssid = "ESP8266-Access-Point";
+const char* password = "123456789";
+
+#define REPORTING_PERIOD_MS 1000
+
+#define DHTPIN 14 // Digital pin connected to the DHT sensor
+#define DHTTYPE DHT11 // DHT 11
+DHT dht(DHTPIN, DHTTYPE);
+
+// current temperature updated in loop()
+float t = 0.0;
+float r = 0.0;
+int o = 0;
+
+// Create AsyncWebServer object on port 80
+AsyncWebServer server(80);
+
+// Create a PulseOximeter object
+PulseOximeter pox;
+
+// Time at which the last beat occurred
+uint32_t tsLastReport = 0;
+// Callback routine is executed when a pulse is detected
+void onBeatDetected() {
+Serial.println("♥ Beat!");
+}
+
+// Generally, you should use "unsigned long" for variables that hold time
+// The value will quickly become too large for an int to store
+unsigned long previousMillis = 0; // will store last time DHT was updated
+
+// Updates DHT readings every 10 seconds
+const long interval = 10000;
+
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+html {
+font-family: Arial;
+display: inline-block;
+margin: 0px auto;
+text-align: center;
+}
+h2 { font-size: 3.0rem; }
+p { font-size: 3.0rem; }
+.units { font-size: 1.2rem; }
+.dht-labels{
+font-size: 1.5rem;
+vertical-align:middle;
+padding-bottom: 15px;
+}
+</style>
+</head>
+<body>
+<h2>CRITII</h2>
+
+<p>
+<span class="dht-labels">Temperature</span>
+<span id="temperature">%TEMPERATURE%</span>
+<sup class="units">&deg;C</sup>
+</p>
+<p>
+<span class="dht-labels2">heartrate</span>
+<span id="heartrate">%HEARTRATE%</span>
+<sup class="units">bpm</sup>
+</p>
+<p>
+<span class="dht-labels2">oxygenlevel</span>
+<span id="oxygenlevel">%OXYGENLEVEL%</span>
+<sup class="units">%</sup>
+</p>
+</body>
+<script>
+setInterval(function ( ) {
+var xhttp = new XMLHttpRequest();
+xhttp.onreadystatechange = function() {
+if (this.readyState == 4 && this.status == 200) {
+document.getElementById("temperature").innerHTML = this.responseText;
+}
+};
+xhttp.open("GET", "/temperature", true);
+xhttp.send();
+}, 2000 ) ;
+
+setInterval(function ( ) {
+var xhttp = new XMLHttpRequest();
+xhttp.onreadystatechange = function() {
+if (this.readyState == 4 && this.status == 200) {
+
+document.getElementById("heartrate").innerHTML = this.responseText;
+}
+};
+xhttp.open("GET", "/heartrate", true);
+xhttp.send();
+}, 2000 ) ;
+
+setInterval(function ( ) {
+var xhttp = new XMLHttpRequest();
+xhttp.onreadystatechange = function() {
+if (this.readyState == 4 && this.status == 200) {
+document.getElementById("oxygenlevel").innerHTML = this.responseText;
+}
+};
+xhttp.open("GET", "/oxygenlevel", true);
+xhttp.send();
+}, 2000 ) ;
+
+</script>
+</html>)rawliteral";
+
+// Replaces placeholder with DHT values
+String processor(const String& var){
+//Serial.println(var);
+if(var == "TEMPERATURE"){
+return String(t);
+}
+if(var == "HEARTRATE"){
+return String(r);
+}
+else if(var == "OXYGENLEVEL"){
+return String(o);
+
+}
+return String();
+}
+
+void setup(){
+Serial.print("Setting AP (Access Point)...");
+WiFi.softAP(ssid, password);
+
+IPAddress IP = WiFi.softAPIP();
+Serial.print("AP IP address: ");
+Serial.println(IP);
+Serial.println(WiFi.localIP());
+
+// Serial port for debugging purposes
+Serial.begin(115200);
+Serial.print("Initializing pulse oximeter..");
+if (!pox.begin()) {
+Serial.println("FAILED");
+for(;;);
+} else {
+Serial.println("SUCCESS");
+}
+
+//pox.begin();
+//Configure sensor to use 7.6mA for LED drive
+pox.setIRLedCurrent(MAX30100_LED_CURR_7_6MA);
+// Register a callback routine
+pox.setOnBeatDetectedCallback(onBeatDetected);
+dht.begin();
+
+// Route for root / web page
+server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+
+request->send_P(200, "text/html", index_html, processor);
+});
+server.on("/temperature", HTTP_GET, [](AsyncWebServerRequest *request){
+request->send_P(200, "text/plain", String(t).c_str());
+});
+server.on("/heartrate", HTTP_GET, [](AsyncWebServerRequest *request){
+request->send_P(200, "text/plain", String(r).c_str());
+});
+server.on("/oxygenlevel", HTTP_GET, [](AsyncWebServerRequest *request){
+request->send_P(200, "text/plain", String(o).c_str());
+});
+
+// Start server
+server.begin();
+}
+
+void loop(){
+pox.update();
+// Grab the updated heart rate and SpO2 levels
+if (millis() - tsLastReport > REPORTING_PERIOD_MS) {
+Serial.print("Heart rate:");
+r = pox.getHeartRate();
+Serial.println(r);
+Serial.print("bpm / SpO2:");
+o = pox.getSpO2();
+Serial.println(o);
+tsLastReport = millis();
+}
+unsigned long currentMillis = millis();
+if (currentMillis - previousMillis >= interval) {
+// save the last time you updated the DHT values
+previousMillis = currentMillis;
+
+// Read temperature as Celsius (the default)
+float newT = dht.readTemperature();
+// Read temperature as Fahrenheit (isFahrenheit = true)
+// float newT = dht.readTemperature(true);
+// if temperature read failed, don't change t value
+if (isnan(newT)) {
+Serial.println("Failed to read from DHT sensor!");
+}
+else {
+t = newT;
+Serial.println(t);
+}
+}
+}
